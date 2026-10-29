@@ -1,0 +1,185 @@
+"""LEDGER: inventory truth. Every failed pick becomes a sensor.
+
+Owns: sku.trust, sku.visibility, sku.record, count_and_refill.
+Wakes on: pick_not_found, trust_drift, count_result, refill_done. Senses: minute (trust decay)."""
+from ..core.llm import tool
+from ..sim.constants import f2, pystr
+from .base import Agent, req
+
+LEDGER_PROMPT = """You are LEDGER, the inventory-truth agent. You own each item's trust score (0-0.99), whether
+it is visible in the customer app, its stock record, and count/refill tasks.
+
+Events you handle:
+- pick_not_found: a picker found the slot empty or short while the record shows stock (phantom stock).
+  Expected: set_trust to 0.10 or lower; hide_item if it is not already hidden, so no new order takes it;
+  lower_aisle_trust for its neighbours the first time; create_count_task(mode="empty") unless a count is open.
+- trust_drift: an item's trust slipped below 0.60 with no recent count. Expected: create_count_task(mode="check").
+- count_result: an associate counted the shelf. Expected: correct_record to the counted number when it
+  differs from the record. If the count was for an empty slot: if counted > 0, restore_item and set_trust ~0.90;
+  if counted is 0 and the backroom has stock, trigger_refill (up to 16); if the backroom is empty, raise_reorder.
+  For a 'check' count that matches the record (within 1), set_trust to 0.95.
+Never restore an item without a count or refill showing stock."""
+
+
+class Ledger(Agent):
+    name, title, tier = "ledger", "Inventory truth", "fast"
+    triggers = frozenset({"pick_not_found", "trust_drift", "count_result", "refill_done"})
+    senses = frozenset({"minute"})
+    prompt = LEDGER_PROMPT
+
+    def __init__(self):
+        super().__init__()
+        self.tools = [
+            tool("set_trust", "Set an item's trust score.", {"sku": {"type": "string"}, "value": {"type": "number"}}, ["sku", "value"]),
+            tool("hide_item", "Hide the item in the customer app so no new order can take it.", {"sku": {"type": "string"}}, ["sku"]),
+            tool("lower_aisle_trust", "Lower trust of other items in the same aisle (likely the same cause).", {"sku": {"type": "string"}}, ["sku"]),
+            tool("create_count_task", "Send a 30-second shelf count to the nearest idle associate.",
+                 {"sku": {"type": "string"}, "mode": {"type": "string", "enum": ["empty", "check"]}}, ["sku", "mode"]),
+            tool("correct_record", "Set the stock record to the counted quantity.", {"sku": {"type": "string"}, "value": {"type": "integer"}}, ["sku", "value"]),
+            tool("trigger_refill", "Move stock from the backroom to the shelf (about 3 minutes).", {"sku": {"type": "string"}, "qty": {"type": "integer"}}, ["sku", "qty"]),
+            tool("restore_item", "Make the item visible in the app again.", {"sku": {"type": "string"}}, ["sku"]),
+            tool("raise_reorder", "The item is truly out: keep it hidden and send a reorder to the warehouse.", {"sku": {"type": "string"}}, ["sku"]),
+        ]
+
+    def sense(self, ev, ctx):
+        w = ctx.state.w
+        for s in w.skus.values():
+            if s.hidden or s.counting or s.status == "out":
+                continue
+            s.trust = round(max(0.3, s.trust - 0.004), 3)
+            if s.trust < 0.6 and w.t - s.get("drift_at", -999) > 300:
+                s.drift_at = w.t
+                w.emit("trust_drift", {"sku": s.id, "trust": s.trust})
+
+    def wants_llm(self, ev, ctx):
+        return ev.type != "refill_done"
+
+    def view(self, ev, ctx):
+        s = ctx.state.sku(ev.sku)
+        item = {"sku": s.id, "name": s.name, "aisle": s.aisle, "record": s.record, "trust": s.trust, "hidden": s.hidden,
+                "status": s.status, "count_task_open": s.counting, "backroom": s.backroom}
+        v = {"event": ev.type, "time": ctx.rt.clock(), "item": item}
+        if ev.type == "pick_not_found":
+            v["record_when_picked"] = ev.record
+            v["units_short"] = len(ev.misses)
+            v["aisle_neighbours"] = [{"sku": x.id, "trust": x.trust} for x in ctx.state.w.skus.values()
+                                     if x.aisle == s.aisle and x is not s]
+        if ev.type == "count_result":
+            v["count"] = {"mode": ev.mode, "counted_on_shelf": ev.counted, "record_at_count": ev.record, "backroom": ev.backroom}
+        return v
+
+    def rules(self, ev, ctx):
+        s = ctx.state.sku(ev.sku)
+        sid, typ = s.id, ev.type
+        if typ == "pick_not_found":
+            plan = [("set_trust", {"sku": sid, "value": 0.1})]
+            if not s.hidden:
+                plan += [("hide_item", {"sku": sid}), ("lower_aisle_trust", {"sku": sid})]
+            if not s.counting:
+                plan.append(("create_count_task", {"sku": sid, "mode": "empty"}))
+            return plan
+        if typ == "trust_drift":
+            return [("create_count_task", {"sku": sid, "mode": "check"})]
+        if typ == "count_result":
+            c, rec, plan = ev.counted, ev.record, []
+            if c != rec:
+                plan.append(("correct_record", {"sku": sid, "value": c}))
+            if ev.mode == "check":
+                plan.append(("set_trust", {"sku": sid, "value": 0.95 if c >= rec - 1 else 0.9}))
+            elif c > 0:
+                plan += [("restore_item", {"sku": sid}), ("set_trust", {"sku": sid, "value": 0.9})]
+            elif ev.backroom > 0:
+                plan.append(("trigger_refill", {"sku": sid, "qty": min(16, ev.backroom)}))
+            else:
+                plan.append(("raise_reorder", {"sku": sid}))
+            return plan
+        if typ == "refill_done":
+            return [("set_trust", {"sku": sid, "value": 0.95}), ("restore_item", {"sku": sid})]
+        return []
+
+    def required(self, ev, ctx):
+        s, need = ctx.state.sku(ev.sku), set()
+        if ev.type == "pick_not_found":
+            if not s.hidden:
+                need.add("hide_item")
+            if not s.counting:
+                need.add("create_count_task")
+        elif ev.type == "count_result":
+            if ev.counted != ev.record:
+                need.add("correct_record")
+            if ev.mode == "empty" and ev.counted <= 0:
+                need.add("trigger_refill" if ev.backroom > 0 else "raise_reorder")
+        return need
+
+    def execute(self, name, a, ctx):
+        st, ev = ctx.state, ctx.event
+        sid = req(a, "sku")
+        s = st.sku(sid)
+        if name == "set_trust":
+            old = s.trust
+            st.set_trust(self.name, sid, req(a, "value"))
+            if ev.type == "count_result" and ev.mode == "check":
+                c, rec = ev.counted, ev.record
+                if c >= rec - 1:
+                    return "Check on %s: record confirmed (%d on the shelf). Trust %s → %s." % (s.name, c, f2(old), f2(s.trust))
+                return ("Check on %s found %d on the shelf, %d fewer than the record. Fixed before any order hit it. "
+                        "Trust %s → %s." % (s.name, c, rec - c, f2(old), f2(s.trust)))
+            if ev.type == "trust_drift" and abs(old - s.trust) >= 0.005:
+                return "Trust for %s: %s → %s." % (s.name, f2(old), f2(s.trust))
+            return None
+        if name == "hide_item":
+            if st.hide(self.name, sid):
+                return ("%s: a picker found the slot empty while the record shows %s. Hidden in the app, so no new order takes it."
+                        % (s.name, ev.get("record", s.record)),
+                        "%s का शेल्फ खाली है। इसे ऐप से छिपा दिया और गिनती का काम भेज दिया है।" % s.name,
+                        "empty")
+            return None
+        if name == "lower_aisle_trust":
+            st.lower_aisle_trust(self.name, sid)
+            return "Neighbours of %s in aisle A%d get a small trust cut (same likely cause)." % (s.name, s.aisle)
+        if name == "create_count_task":
+            if st.request_count(self.name, sid, req(a, "mode")):
+                if a["mode"] == "check":
+                    return "Trust for %s fell to %s with no recent count. Sent a 30-second check before any order fails on it." % (s.name, f2(s.trust))
+                return "30-second count task for %s sent to the nearest idle associate." % s.name
+            return None
+        if name == "correct_record":
+            old = s.record
+            st.correct_record(self.name, sid, req(a, "value"))
+            return ("Count for %s: %d on the shelf, %s in the backroom. Record corrected from %d."
+                    % (s.name, s.record, ev.get("backroom", s.backroom), old), None, "count")
+        if name == "trigger_refill":
+            st.request_refill(self.name, sid, req(a, "qty"))
+            return "Refill of %s × %s from the backroom requested (about 3 minutes)." % (pystr(a["qty"]), s.name)
+        if name == "restore_item":
+            st.restore(self.name, sid)
+            return ("%s is live again with %d units. Similar items get extra checks." % (s.name, s.shelf), None, "live")
+        if name == "raise_reorder":
+            st.mark_out(self.name, sid)
+            return "%s is truly out of stock: none in the backroom. It stays hidden and a reorder went to the warehouse." % s.name
+        raise ValueError(name)
+
+    def post(self, ev, ctx):
+        s = ctx.state.sku(ev.get("sku")) if "sku" in ev else None
+        if s is None:
+            return
+        if ev.type == "count_result":
+            if ev.mode == "empty" and ev.counted > 0:
+                ctx.state.w.kpi["falseFlags"] += 1
+            if ev.mode == "check" or (not s.hidden and s.status != "refilling"):
+                ctx.state.finish_check(self.name, s.id)
+            if ev.mode == "check" and ev.counted < ev.record - 1:
+                ctx.state.w.stats["fixed"] += 1
+        if ev.type == "refill_done" and s.hidden:
+            s.counting = False
+
+    def describe(self, name, a, ctx):
+        s = ctx.state.sku(a.get("sku", ""))
+        nm = s.name if s else pystr(a.get("sku"))
+        m = {"set_trust": "Set trust for %s to %s." % (nm, pystr(a.get("value"))), "hide_item": "Hide %s in the app." % nm,
+             "lower_aisle_trust": "Lower trust for %s's aisle." % nm,
+             "create_count_task": "Send a %s count for %s." % (pystr(a.get("mode")), nm),
+             "correct_record": "Correct %s's record to %s." % (nm, pystr(a.get("value"))),
+             "trigger_refill": "Refill %s × %s." % (pystr(a.get("qty")), nm), "restore_item": "Restore %s." % nm,
+             "raise_reorder": "Reorder %s." % nm}
+        return m.get(name, name)

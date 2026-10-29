@@ -1,0 +1,22 @@
+# One-click deploy on Render (free plan): New + > Blueprint > pick this repo, paste GROQ_API_KEY when asked.
+services:
+  - type: web
+    name: syncstore
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.server.app:app --host 0.0.0.0 --port $PORT --ws-ping-interval 20
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL_SMART
+        value: llama-3.3-70b-versatile
+      - key: GROQ_MODEL_FAST
+        value: llama-3.1-8b-instant
+      - key: GROQ_RPM
+        value: "25"
+      - key: GROQ_RPD
+        value: "900"
